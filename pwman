@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import json
+import os
+import secrets
+import string
+import sys
+import time
+from getpass import getpass
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+except ImportError:
+    print("Error: 'cryptography' library is required. Install it with 'pip install cryptography'.")
+    sys.exit(1)
+
+VAULT_PATH = None
+ITERATIONS = 100_000
+SALT_SIZE = 16
+NONCE_SIZE = 12
+CURRENT_KEY_VERSION = 1
+
+
+def get_vault_path() -> Path:
+    global VAULT_PATH
+    return VAULT_PATH
+
+
+def derive_key(passphrase: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=ITERATIONS,
+    )
+    return kdf.derive(passphrase.encode())
+
+
+def encrypt_vault(data: Dict[str, Any], passphrase: str) -> Dict[str, str]:
+    salt = os.urandom(SALT_SIZE)
+    key = derive_key(passphrase, salt)
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(NONCE_SIZE)
+    
+    plaintext = json.dumps(data).encode()
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    
+    return {
+        "salt": base64.b64encode(salt).decode(),
+        "nonce": base64.b64encode(nonce).decode(),
+        "ciphertext": base64.b64encode(ciphertext).decode()
+    }
+
+
+def decrypt_vault(vault_data: Dict[str, str], passphrase: str) -> Dict[str, Any]:
+    try:
+        salt = base64.b64decode(vault_data["salt"])
+        nonce = base64.b64decode(vault_data["nonce"])
+        ciphertext = base64.b64decode(vault_data["ciphertext"])
+        
+        key = derive_key(passphrase, salt)
+        aesgcm = AESGCM(key)
+        
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return json.loads(plaintext)
+    except (InvalidTag, KeyError, ValueError):
+        raise ValueError("Invalid passphrase or corrupted vault")
+
+
+def load_vault(passphrase: Optional[str] = None) -> Dict[str, Any]:
+    path = get_vault_path()
+    if not path.exists():
+        return {"metadata": {"key_version": CURRENT_KEY_VERSION}, "entries": {}}
+    
+    if passphrase is None:
+        passphrase = getpass("Enter master passphrase: ")
+    
+    try:
+        with open(path, "r") as f:
+            vault_data = json.load(f)
+        return decrypt_vault(vault_data, passphrase)
+    except json.JSONDecodeError:
+        # If the file exists but is not valid JSON (starting over)
+        return {"metadata": {"key_version": CURRENT_KEY_VERSION}, "entries": {}}
+
+
+def save_vault(vault: Dict[str, Any], passphrase: str) -> None:
+    path = get_vault_path()
+    encrypted = encrypt_vault(vault, passphrase)
+    path.write_text(json.dumps(encrypted, indent=2))
+    # Restrict file permissions
+    path.chmod(0o600)
+
+
+def matrix_animate(text: str, delay: float = 0.03, rtl: bool = False):
+    """Animate text appearing with a Matrix-like flipping effect. 
+    Can reveal from Left-to-Right (default) or Right-to-Left.
+    """
+    length = len(text)
+    # Start with a line of placeholders or spaces
+    display = [" " for _ in range(length)]
+    chars = string.ascii_letters + string.digits + string.punctuation
+    
+    indices = list(range(length))
+    if rtl:
+        indices.reverse()
+    
+    # \033[K clears the line from cursor to end to prevent ghosts from previous labels
+    for i in indices:
+        # Flip random characters a few times before locking in the correct one
+        for _ in range(4):
+            display[i] = secrets.choice(chars)
+            sys.stdout.write(f"\r{''.join(display)}\033[K")
+            sys.stdout.flush()
+            time.sleep(delay)
+        
+        display[i] = text[i]
+        sys.stdout.write(f"\r{''.join(display)}\033[K")
+        sys.stdout.flush()
+    
+    print()  # Final newline
+
+
+def generate_custom_password(
+    length: int = 16,
+    use_upper: bool = True,
+    use_lower: bool = True,
+    use_digits: bool = True,
+    use_symbols: bool = True
+) -> str:
+    if length < 12:
+        raise ValueError("Password length must be at least 12 characters")
+
+    chars = ""
+    if use_lower: chars += string.ascii_lowercase
+    if use_upper: chars += string.ascii_uppercase
+    if use_digits: chars += string.digits
+    if use_symbols: chars += string.punctuation
+
+    if not chars:
+        raise ValueError("At least one character type must be selected")
+
+    # Ensure at least one of each selected type is included
+    password = []
+    if use_lower: password.append(secrets.choice(string.ascii_lowercase))
+    if use_upper: password.append(secrets.choice(string.ascii_uppercase))
+    if use_digits: password.append(secrets.choice(string.digits))
+    if use_symbols: password.append(secrets.choice(string.punctuation))
+
+    # Fill the rest
+    while len(password) < length:
+        password.append(secrets.choice(chars))
+
+    secrets.SystemRandom().shuffle(password)
+    return ''.join(password)
+
+
+def create_password(name: str, length: int, upper: bool, digits: bool, symbols: bool) -> None:
+    passphrase = getpass("Set master passphrase for the vault: ")
+    confirm = getpass("Confirm master passphrase: ")
+    
+    if passphrase != confirm:
+        raise ValueError("Passphrases do not match")
+
+    vault = load_vault(passphrase)
+
+    if name in vault["entries"]:
+        choice = input(f"Entry '{name}' already exists. Overwrite? (y/N): ").lower()
+        if choice != 'y':
+            print("Operation cancelled.")
+            return
+
+    while True:
+        password = generate_custom_password(length, upper, True, digits, symbols)
+        # Suggestion appears from Right-to-Left without label as requested
+        matrix_animate(password, rtl=True)
+        
+        action = input("(a)ccept, (r)egenerate, (q)uit: ").lower()
+        
+        if action == 'a':
+            vault["entries"][name] = {
+                "password": password,
+                "key_version": CURRENT_KEY_VERSION
+            }
+            save_vault(vault, passphrase)
+            print(f"\nSuccessfully saved password for '{name}'.")
+            break
+        elif action == 'r':
+            continue
+        elif action == 'q':
+            print("Operation cancelled.")
+            break
+
+
+def get_password(name: str) -> None:
+    passphrase = getpass("Enter master passphrase: ")
+    vault = load_vault(passphrase)
+
+    if name not in vault["entries"]:
+        raise KeyError(f"No password stored for '{name}'")
+
+    entry = vault["entries"][name]
+    sys.stdout.write(f"Password for '{name}': ")
+    sys.stdout.flush()
+    matrix_animate(entry["password"])
+
+
+def list_entries() -> None:
+    passphrase = getpass("Enter master passphrase: ")
+    vault = load_vault(passphrase)
+
+    if not vault["entries"]:
+        print("Vault is empty")
+        return
+
+    print(f"{'Entry Name':<20} | {'Key Version'}")
+    print("-" * 35)
+    for name, data in vault["entries"].items():
+        print(f"{name:<20} | {data.get('key_version', 'unknown')}")
+
+
+def delete_entry(name: str) -> None:
+    passphrase = getpass("Enter master passphrase: ")
+    vault = load_vault(passphrase)
+
+    if name not in vault["entries"]:
+        print(f"Error: Entry '{name}' not found.")
+        return
+
+    confirm = input(f"Are you sure you want to delete '{name}'? (y/N): ").lower()
+    if confirm == 'y':
+        del vault["entries"][name]
+        save_vault(vault, passphrase)
+        print(f"Successfully deleted '{name}'.")
+    else:
+        print("Delete cancelled.")
+
+
+def store_secret(name: str, visible: bool = False) -> None:
+    passphrase = getpass("Enter master passphrase: ")
+    vault = load_vault(passphrase)
+
+    if name in vault["entries"]:
+        choice = input(f"Entry '{name}' already exists. Overwrite? (y/N): ").lower()
+        if choice != 'y':
+            print("Operation cancelled. Use 'update' to modify an existing entry.")
+            return
+
+    if visible:
+        print(f"Enter secret (API key, seedphrase, etc.) for '{name}' (VISIBLE):")
+        secret = input("> ")
+    else:
+        secret = getpass(f"Enter secret (API key, seedphrase, etc.) for '{name}': ")
+    
+    if not secret:
+        print("Error: Secret cannot be empty.")
+        return
+
+    # Use the current global version for new entries
+    current_version = vault.get("metadata", {}).get("key_version", CURRENT_KEY_VERSION)
+    vault["entries"][name] = {
+        "password": secret,
+        "key_version": current_version,
+        "type": "manual"
+    }
+    
+    save_vault(vault, passphrase)
+    print(f"Successfully stored '{name}'.")
+
+
+def update_entry(name: str, visible: bool = False) -> None:
+    passphrase = getpass("Enter master passphrase: ")
+    vault = load_vault(passphrase)
+
+    if name not in vault["entries"]:
+        print(f"Error: Entry '{name}' not found. Use 'store' to create a new one.")
+        return
+
+    if visible:
+        print(f"Enter NEW secret for '{name}' (VISIBLE):")
+        secret = input("> ")
+    else:
+        secret = getpass(f"Enter NEW secret for '{name}': ")
+
+    if not secret:
+        print("Error: Secret cannot be empty.")
+        return
+
+    # Update value but keep/update version
+    current_version = vault.get("metadata", {}).get("key_version", CURRENT_KEY_VERSION)
+    vault["entries"][name]["password"] = secret
+    vault["entries"][name]["key_version"] = current_version
+    
+    save_vault(vault, passphrase)
+    print(f"Successfully updated '{name}'.")
+
+
+def rotate_key() -> None:
+    path = get_vault_path()
+    if not path.exists():
+        print(f"Error: No vault found at {path} to rotate.")
+        return
+
+    print(f"--- Key Rotation for {path.name} ---")
+    old_passphrase = getpass("Enter CURRENT master passphrase: ")
+    
+    try:
+        # Load and decrypt with old passphrase
+        with open(path, "r") as f:
+            vault_data = json.load(f)
+        vault = decrypt_vault(vault_data, old_passphrase)
+    except Exception as e:
+        print(f"Error: Could not decrypt vault. {e}")
+        return
+
+    new_passphrase = getpass("Enter NEW master passphrase: ")
+    confirm = getpass("Confirm NEW master passphrase: ")
+    
+    if new_passphrase != confirm:
+        print("Error: New passphrases do not match. Rotation cancelled.")
+        return
+
+    if new_passphrase == old_passphrase:
+        print("Warning: New passphrase is the same as the old one.")
+
+    # Increment versions
+    new_version = vault.get("metadata", {}).get("key_version", 0) + 1
+    vault["metadata"] = {"key_version": new_version}
+    
+    for entry_name in vault["entries"]:
+        vault["entries"][entry_name]["key_version"] = new_version
+
+    save_vault(vault, new_passphrase)
+    print(f"Successfully rotated key to version {new_version} and updated passphrase.")
+
+
+def show_help():
+    help_text = """
+pwman - Encrypted CLI Password & Secret Manager
+
+USAGE:
+    pwman [global options] <command> [arguments]
+
+GLOBAL OPTIONS:
+    --vault, -v <path>  Specify a custom vault file path.
+                        Default: ~/.pwman_vault.json
+                        Can also be set via PWMAN_VAULT environment variable.
+
+COMMANDS:
+    create <name>       Generate and store a new password interactively.
+                        Flags:
+                          --length, -l <int>   Length (min 12, default 16)
+                          --no-upper           Exclude uppercase letters
+                          --no-digits          Exclude numbers
+                          --no-symbols         Exclude special characters
+
+    store <name>        Manually enter and secure a secret (e.g. API keys, seedphrases).
+                        Flags:
+                          --visible            Show input as you type (useful for seedphrases)
+
+    update <name>       Update the value of an existing secret.
+                        Flags:
+                          --visible            Show input as you type
+
+    delete <name>       Permanently remove a secret from the vault.
+
+    rotate              Change your master passphrase and re-encrypt the vault.
+
+    get <name>          Retrieve and decrypt a stored password or secret.
+
+    list                List all stored entry names and their key versions.
+
+    help                Show this detailed usage guide.
+
+SECURITY:
+    - Entire vault is encrypted using AES-GCM.
+    - Master key derived via PBKDF2-HMAC-SHA256 (100,000 iterations).
+    - Manual secrets (like seedphrases) never touch shell history.
+    """
+    print(help_text)
+
+
+def main():
+    global VAULT_PATH
+    
+    parser = argparse.ArgumentParser(
+        prog="pwman",
+        description="Encrypted CLI password manager",
+        add_help=False
+    )
+
+    # Global options
+    parser.add_argument("--vault", "-v", help="Custom vault path")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # create
+    create_parser = subparsers.add_parser("create")
+    create_parser.add_argument("name")
+    create_parser.add_argument("--length", "-l", type=int, default=16)
+    create_parser.add_argument("--no-upper", action="store_false", dest="upper")
+    create_parser.add_argument("--no-digits", action="store_false", dest="digits")
+    create_parser.add_argument("--no-symbols", action="store_false", dest="symbols")
+    create_parser.set_defaults(upper=True, digits=True, symbols=True)
+
+    # store
+    store_parser = subparsers.add_parser("store")
+    store_parser.add_argument("name")
+    store_parser.add_argument("--visible", action="store_true", help="Show input as you type")
+
+    # update
+    update_parser = subparsers.add_parser("update")
+    update_parser.add_argument("name")
+    update_parser.add_argument("--visible", action="store_true", help="Show input as you type")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete")
+    delete_parser.add_argument("name")
+
+    # rotate
+    subparsers.add_parser("rotate")
+
+    # get
+    get_parser = subparsers.add_parser("get")
+    get_parser.add_argument("name")
+
+    # list
+    subparsers.add_parser("list")
+
+    # help
+    subparsers.add_parser("help")
+
+    args = parser.parse_args()
+
+    # Determine vault path: 1. Flag, 2. Env, 3. Default
+    vault_env = os.environ.get("PWMAN_VAULT")
+    if args.vault:
+        VAULT_PATH = Path(args.vault)
+    elif vault_env:
+        VAULT_PATH = Path(vault_env)
+    else:
+        VAULT_PATH = Path.home() / ".pwman_vault.json"
+
+    try:
+        if args.command == "create":
+            create_password(args.name, args.length, args.upper, args.digits, args.symbols)
+
+        elif args.command == "store":
+            store_secret(args.name, args.visible)
+
+        elif args.command == "update":
+            update_entry(args.name, args.visible)
+
+        elif args.command == "delete":
+            delete_entry(args.name)
+
+        elif args.command == "rotate":
+            rotate_key()
+
+        elif args.command == "get":
+            get_password(args.name)
+
+        elif args.command == "list":
+            list_entries()
+
+        elif args.command == "help" or not args.command:
+            show_help()
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
